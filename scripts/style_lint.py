@@ -1,18 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""style_lint.py — 子曰文风体检器
+"""style_lint.py — 子曰文风「表层特征」检测器 v2
 
-对一段文本做 16 项量化体检，与从本人语料实测得出的基线区间比对，
-输出偏离项。用于「写完自检」和「判断某段文字像不像我写的」。
+【能力边界，先读这段】
+本脚本只测可以计量的表层特征：句长分布、标点习惯、词表命中、结构符号。
+它无法判断一段文字读起来是否像本人，也无法判断思路是否连贯、用典是否恰当、
+内容是否准确。
+
+PASS 的含义仅限于：这些表层指标落在语料基线内。
+不得把 PASS 当成「风格验证成功」——真正的验证需要人做盲测，见 EVALUATION.md。
+
+【指标口径说明】
+- idiom_pk        固定四字表达（封闭词表命中）/ 千字。只统计词表内的，词表外一律不计。
+- cluster4_pk     长度 ≥4 的连续汉字串 / 千字。这是「四字块密度」的粗代理，
+                  包含普通词组与专名，**不代表成语使用量**。
+- wo_pk           汉字「我」的出现频率。
+- self_pk         「自己」的出现频率。
+- first_uniq_pk   「我」+「自己」−「我自己/我们自己」，避免同指重复计数。
+- wenyan_char_pk  文言候选字符频率（之其亦乃遂矣焉哉兮故皆犹岂莫未而）。
+                  **这是字符频率，不是语法分析**；「而」「其」「之」在现代汉语里
+                  同样常见（而且、其中、之后），所以该值高不等于「文白夹杂程度高」。
+- classical_mark_pk 强文言标记字频率（矣焉哉兮乃遂亦岂莫犹），现代汉语少用，判别力更强。
+- simile_pk       强比喻标记（好似/宛如/就像/如同/仿佛/好比/恰似）。
+                  「好像」「一般」归入 ambiguous 提示，不计入比喻，因为
+                  「一般人」「一般情况下」是普通用法。
+- 其余词频（口语、模糊限定）同为候选词命中数，不是语法判断。
 
 用法：
-    python style_lint.py --file a.txt b.md
-    python style_lint.py --text "一段文字"
-    python style_lint.py --file x.txt --json
-    python style_lint.py --corpus          # 打印 references/corpus 下全部语料的指标（校准用）
-    python style_lint.py --register        # 只打印「我」的写作登记表（给模型看的紧凑版）
+    python style_lint.py --file a.txt
+    python style_lint.py --text "一段话"
+    python style_lint.py --file a.txt --mode long_essay
+    python style_lint.py --file a.txt --json
+    python style_lint.py --corpus        # 打印 references/corpus 的指标（校准用）
+    python style_lint.py --register      # 紧凑版写作登记表
 
-退出码：0 未超阈值；1 存在硬伤（AI 味词 / emoji / Markdown 结构符号）。
+退出码（与 README、SKILL.md 保持一致）：
+    0  通过：无硬伤，也无偏离
+    1  硬伤：确定不该出现的元素（emoji / 省略号 / 书名号 / Markdown 结构 / 硬级套话）
+    2  偏离：无硬伤，但表层指标超出基线（需人工判断是否接受）
 """
 
 import argparse
@@ -28,56 +53,193 @@ except Exception:
     pass
 
 HAN = "\u4e00-\u9fa5"
+HAN_RE = re.compile("[" + HAN + "]")
+HAN_CHAR = re.compile("[" + HAN + "]")
 
 # ---------------------------------------------------------------- 词表
+# 说明：以下均为「候选词命中」用的封闭词表，不是语法标注结果。
 
-# AI 味 / 公文味标记：他的语料里从不出现，一旦出现即判定为「不像」
-AI_SMELL = [
-    "综上所述", "总而言之", "总的来说", "值得注意的是",
-    "首先，", "其次，", "最后，", "一方面", "另一方面", "不仅如此", "与此同时",
-    "在当今", "随着社会", "随着科技", "不可否认", "毋庸置疑", "众所周知",
-    "赋能", "抓手", "闭环", "落地生根", "深度融合", "显著提升", "至关重要",
-    "让我们", "本文将", "笔者", "综上", "由此可见", "深入剖析",
-    "层层递进", "维度上", "从某种意义上说", "可以说，",
+# 硬伤级：行话与总结腔，本人语料 0 次，且在任何中文写作里都属于空转表达
+HARD_PHRASES = [
+    "赋能", "抓手", "闭环", "落地生根", "深度融合",
+    "全面提升", "综上所述", "由此可见", "毋庸置疑",
 ]
 
-# 文言虚词（他高频使用，是文白夹杂的量化抓手）
-WENYAN = "之其亦乃遂矣焉哉兮故皆犹岂莫未而"
+# 提醒级：在说明文/公文里完全正常，只在个人随笔里显得像模板
+SOFT_PHRASES = [
+    "首先，", "其次，", "最后，", "因此，", "总的来说，", "总而言之，",
+    "值得注意的是，", "一方面，", "另一方面，",
+    "不可否认", "众所周知", "显著提升", "至关重要", "层层递进", "深入剖析",
+    "从某种意义上说", "让我们", "本文将", "笔者", "在当今",
+    "随着社会", "随着科技",
+]
 
-# 口语词（他写长文时也不避口语，这是「不装」的证据）
-COLLOQUIAL = ["啥", "咋", "弄", "搞", "挺", "哎", "啊", "呢", "嘛", "呗", "玩意儿", "这玩意儿"]
+# 固定四字表达（封闭词表，命中即计）。未登录的四字词组不会计入 idiom_pk。
+IDIOMS = frozenset("""
+一心一意 三心二意 四面八方 五湖四海 七上八下 九牛一毛 十全十美
+不知不觉 不慌不忙 不紧不慢 不声不响 不言而喻 不约而同 不由自主
+不闻不问 不屑一顾 不置可否 不欢而散 不甘示弱 不计其数
+千方百计 千言万语 千辛万苦 万无一失 理所当然 理直气壮
+自言自语 自由自在 自作自受 自相矛盾 自给自足 自暴自弃
+大同小异 大起大落 大彻大悟 大惊小怪 大器晚成 大相径庭
+小心翼翼 小题大做 小肚鸡肠
+无中生有 无动于衷 无微不至 无所适从 无能为力 无济于事 无独有偶
+有条不紊 有气无力 有始有终 有增无减 有恃无恐
+半信半疑 半途而废 半推半就
+各抒己见 各得其所 各行其是
+同心协力 同舟共济
+如释重负 如履薄冰 如鱼得水 如火如荼 如影随形
+好高骛远 好逸恶劳
+妄自菲薄 安居乐业
+心平气和 心灰意冷 心猿意马 心甘情愿 心照不宣 心旷神怡 心外无物
+念念不忘 恋恋不舍
+持之以恒 按部就班 挥之不去
+推心置腹 措手不及
+望而生畏 朝三暮四 杞人忧天
+格格不入 欲盖弥彰
+水到渠成 水滴石穿
+深思熟虑 沧海桑田
+漫不经心 潜移默化
+牵强附会 独善其身 琳琅满目
+画蛇添足 目瞪口呆
+相形见绌 眉飞色舞
+矢志不渝 破釜沉舟
+蔚然成风 融会贯通
+见微知著 言简意赅
+谨小慎微 责无旁贷
+身临其境 车载斗量
+迎刃而解 适得其反
+锲而不舍 随心所欲
+雷厉风行 顺理成章
+风平浪静 风雨无阻
+一目了然 一五一十 一清二楚 一针见血 一如既往 一意孤行 一败涂地
+三言两语 三番五次 五颜六色 五花八门 十拿九稳
+不三不四 不伦不类 不折不扣 不慌不忙
+井井有条 井然有序
+光明正大 光明磊落
+兴高采烈 兴致勃勃
+冷眼旁观 冷嘲热讽
+刻舟求剑 削足适履
+勇往直前 势如破竹
+化险为夷 十全十美
+坐井观天 坚如磐石
+多此一举 夜郎自大
+守株待兔 实事求是
+完璧归赵 对症下药
+层出不穷 层峦叠嶂
+川流不息 巧夺天工
+废寝忘食 异想天开
+弱不禁风 强人所难
+得不偿失 得心应手
+循规蹈矩 微乎其微
+心悦诚服 忠言逆耳
+急功近利 怨天尤人
+惟妙惟肖 惊心动魄
+想方设法 四面八方
+手忙脚乱 手舞足蹈
+投机取巧 拨云见日
+拾金不昧 挥洒自如
+有条有理 望穿秋水
+杯弓蛇影 柳暗花明
+栩栩如生 模棱两可
+欢天喜地 欲速不达
+步步为营 死心塌地
+沧海一粟 流水不腐
+浑然天成 焦头烂额
+独具匠心 独树一帜
+痛定思痛 百无聊赖
+百折不挠 相辅相成
+瞬息万变 破镜重圆
+硕果累累 神通广大
+祸不单行 稍纵即逝
+突飞猛进 立竿见影
+精打细算 精雕细琢
+经天纬地 络绎不绝
+缺一不可 罄竹难书
+耳濡目染 聚沙成塔
+胆战心惊 背水一战
+舍己为人 良莠不齐
+草木皆兵 落井下石
+虚怀若谷 蛛丝马迹
+街谈巷议 触类旁通
+言之凿凿 言外之意
+诚惶诚恐 谈虎色变
+负荆请罪 赏心悦目
+走马观花 赴汤蹈火
+踌躇满志 车载斗量
+近水楼台 返璞归真
+迫在眉睫 追根溯源
+通宵达旦 造谣惑众
+郑人买履 野火烧不尽
+量力而行 金玉良言
+铁证如山 锲而不舍
+闭门造车 防微杜渐
+阳奉阴违 随波逐流
+隐入尘埃 集思广益
+青出于蓝 顺水推舟
+风起云涌 饱经风霜
+马到成功 驾轻就熟
+高瞻远瞩 鬼斧神工
+鱼贯而入 鸟语花香
+一曝十寒 不了了之 自欺欺人 悬而未决
+半途而废 从容不迫 云卷云舒 素履以往
+穷且益坚 生生不息 运筹帷幄 胸有成竹
+壮士断腕 所向披靡 天马行空 垂垂老矣
+肝胆气郁 礼崩乐坏 顺其自然 顺其本然
+不以物喜 不以己悲 心外无物 一苇以航
+""".split())
 
-# 比喻标记（他偏爱「好似/宛如/就像/如同/仿佛/一般」）
-SIMILE = ["好似", "宛如", "就像", "如同", "仿佛", "一般", "好像", "好比"]
+# 文言候选字符（字符频率，非语法判断）
+WENYAN_CANDIDATE = "之其亦乃遂矣焉哉兮故皆犹岂莫未而"
+# 强标记：现代汉语书面语中很少单独使用，判别力更强
+WENYAN_STRONG = "矣焉哉兮乃遂亦岂莫犹"
 
-# 概率化措辞（他极少下绝对判断）
+COLLOQUIAL = ["啥", "咋", "弄", "搞", "挺", "哎", "啊", "呢", "嘛", "呗", "玩意儿"]
+
+# 强比喻标记（明确引出喻体）
+SIMILE_STRONG = ["好似", "宛如", "就像", "如同", "仿佛", "好比", "恰似", "似的"]
+# 两可用法：可能是比喻，也可能是普通限定/推测，仅作提示不计入比喻
+SIMILE_AMBIGUOUS = ["好像", "一般"]
+
 HEDGE = ["可能", "或许", "大概率", "大概", "似乎", "也许", "应该", "说不定", "差不多"]
 
-# 隐私/不适合入语料的条目已在建库时剔除，此处不做过滤
 
+# ---------------------------------------------------------------- 基础函数
 
 def han_count(t: str) -> int:
-    return len(re.findall("[" + HAN + "]", t))
+    return len(HAN_CHAR.findall(t))
 
 
-def clean(text: str) -> str:
-    """剥掉语料文件里的说明行与元数据行。"""
+def strip_corpus_notes(text: str) -> str:
+    """只剥掉语料自带的【说明】行。
+
+    **不删 `#` 开头的行**：Markdown 标题检测必须基于原始文本，
+    否则结构化符号会在检查前被清掉，永远测不出来。
+    """
     lines = []
     for ln in text.splitlines():
         s = ln.strip()
         if not s:
             continue
-        if s.startswith("【说明】") or s.startswith("#"):
+        if s.startswith("【说明】"):
             continue
         lines.append(s)
     return "\n".join(lines)
 
 
+def md_struct_lines(text: str) -> int:
+    """在原始文本上统计 Markdown 结构行（标题 / 列表 / 引用）。"""
+    return sum(
+        1
+        for ln in text.splitlines()
+        if re.match(r"^\s*(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)", ln)
+    )
+
+
 def split_sentences(text: str):
-    """按句末标点与换行切句；换行在观察清单式文本里就是句界。"""
-    raw = re.split(r"[。！？!?；;\n]+", text)
+    """按句末标点与换行切句；换行在清单式文本里就是句界。"""
     out = []
-    for s in raw:
+    for s in re.split(r"[。！？!?；;\n]+", text):
         s = s.strip().strip("“”\"'（）()")
         if han_count(s) >= 2:
             out.append(s)
@@ -92,24 +254,77 @@ def count_any(text: str, words) -> int:
     return sum(text.count(w) for w in words)
 
 
+def count_simile(text: str):
+    """返回 (强比喻标记数, 两可用法数)。
+
+    「一般人」「一般情况下」「一般而言」「一般说来」等为普通限定，不计入。
+    """
+    strong = count_any(text, SIMILE_STRONG)
+    amb = 0
+    for w in SIMILE_AMBIGUOUS:
+        if w != "一般":
+            amb += text.count(w)
+            continue
+        for m in re.finditer("一般", text):
+            nxt = text[m.end():m.end() + 2]
+            if not re.match(r"(?:人|情况|而言|说来|地|般|性|化|都|是|不|无二|来讲|来说)", nxt):
+                amb += 1
+    return strong, amb
+
+
+def count_idioms(text: str) -> int:
+    """固定四字表达命中数（贪心、不重叠）。
+
+    与旧版的关键差异：**不再要求前后不是汉字**。
+    「他做事悬而未决，让人着急」里「悬而未决」照样命中。
+    """
+    hits, i, n = 0, 0, len(text)
+    while i + 4 <= n:
+        if text[i:i + 4] in IDIOMS:
+            hits += 1
+            i += 4
+        else:
+            i += 1
+    return hits
+
+
+def count_long_clusters(text: str) -> int:
+    """长度 ≥4 的连续汉字串个数（四字块密度的粗代理，非成语计数）。"""
+    return len(re.findall("[" + HAN + "]{4,}", text))
+
+
+def person_counts(text: str):
+    """返回 (我, 自己, 同指重复数, 去重后第一人称指称数)。
+
+    「我自己」「我们自己」在两个单项里各被数了一次，去重时扣回。
+    """
+    wo = text.count("我")
+    self_ = text.count("自己")
+    both = text.count("我自己") + text.count("我们自己")
+    return wo, self_, both, wo + self_ - both
+
+
+# ---------------------------------------------------------------- 指标
+
 def metrics(text: str) -> dict:
-    text = clean(text)
-    chars = han_count(text)
-    sents = split_sentences(text)
+    md_lines = md_struct_lines(text)      # 先算，不能受清洗影响
+    t = strip_corpus_notes(text)
+
+    chars = han_count(t)
+    sents = split_sentences(t)
     n = len(sents) or 1
     lens = [han_count(s) for s in sents]
     avg = round(sum(lens) / n, 2)
     sd = round(statistics.pstdev(lens), 2) if len(lens) > 1 else 0.0
     short = sum(1 for x in lens if x <= 12)
     long_ = sum(1 for x in lens if x >= 40)
-    commas = text.count("，") + text.count("、")
-    q = text.count("？") + text.count("?")
-    idiom4 = len(re.findall(r"(?<![" + HAN + r"])[" + HAN + r"]{4}(?![" + HAN + r"])", text))
-    first = count_any(text, ["我", "自己"])
-    dash = text.count("——") + text.count("—")
-    emoji = len(re.findall("[\U0001F300-\U0001FAFF\u2600-\u27BF]", text))
-    md_lines = sum(1 for ln in text.splitlines() if re.match(r"^\s*(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)", ln))
-    smell = [w for w in AI_SMELL if w in text]
+    commas = t.count("，") + t.count("、")
+    period = t.count("。") or 1
+    q = t.count("？") + t.count("?")
+
+    wo, self_, both, uniq = person_counts(t)
+    strong_simile, amb_simile = count_simile(t)
+
     return {
         "chars": chars,
         "sentences": len(sents),
@@ -118,30 +333,43 @@ def metrics(text: str) -> dict:
         "short_ratio": round(short / n, 3),
         "long_ratio": round(long_ / n, 3),
         "comma_per_sent": round(commas / n, 2),
+        "comma_period_ratio": round(commas / period, 2),
         "question_ratio": round(q / n, 3),
-        "wenyian_pk": pk(count_any(text, list(WENYAN)), chars),
-        "idiom4_pk": pk(idiom4, chars),
-        "first_person_pk": pk(first, chars),
-        "colloquial_pk": pk(count_any(text, COLLOQUIAL), chars),
-        "simile_pk": pk(count_any(text, SIMILE), chars),
-        "hedge_pk": pk(count_any(text, HEDGE), chars),
-        "dash_pk": pk(dash, chars),
-        # 标点硬伤项：作者全语料 0 次
-        "ellipsis": text.count("……") + text.count("...") + text.count("…"),
-        "book_title": text.count("《"),
-        "exclaim": text.count("！") + text.count("!"),
-        "comma_colon_ratio": round(commas / (text.count("。") or 1), 2),
-        "ai_smell": smell,
-        "emoji": emoji,
+        # 词法（封闭词表命中，非语法分析）
+        "idiom_pk": pk(count_idioms(t), chars),
+        "cluster4_pk": pk(count_long_clusters(t), chars),
+        "wenyan_char_pk": pk(count_any(t, list(WENYAN_CANDIDATE)), chars),
+        "classical_mark_pk": pk(count_any(t, list(WENYAN_STRONG)), chars),
+        "colloquial_pk": pk(count_any(t, COLLOQUIAL), chars),
+        "simile_pk": pk(strong_simile, chars),
+        "simile_ambiguous_pk": pk(amb_simile, chars),
+        "hedge_pk": pk(count_any(t, HEDGE), chars),
+        # 人称（分开统计，避免同指重复）
+        "wo_pk": pk(wo, chars),
+        "self_pk": pk(self_, chars),
+        "first_uniq_pk": pk(uniq, chars),
+        # 标点与结构
+        "dash_pk": pk(t.count("——") + t.count("—"), chars),
+        "ellipsis": t.count("……") + t.count("…") + t.count("..."),
+        "book_title": t.count("《"),
+        "exclaim": t.count("！") + t.count("!"),
+        "emoji": len(re.findall("[\U0001F300-\U0001FAFF\u2600-\u27BF]", t)),
         "md_struct_lines": md_lines,
+        # 套话分级
+        "hard_phrases": [w for w in HARD_PHRASES if w in t],
+        "soft_phrases": [w for w in SOFT_PHRASES if w in t],
     }
 
+
 # ---------------------------------------------------------------- 基线
-# 由 references/corpus 实测得出（长随笔 / 短札 / 观察清单三档），
-# lo/hi 为「宽松可接受区间」，超出记 WARN；硬伤项单独判定。
+# 由 references/corpus 实测得出（--corpus 可复现）：
+#   长随笔 2513 字：idiom 5.97｜cluster4 118.98｜文言候选 14.33｜强文言 2.39
+#                   人称去重 31.04（我 28.65 + 自己 2.79）｜比喻 3.18｜模糊 6.76
+#   短札 1963 字：  idiom 5.60｜cluster4 109.53｜文言候选 12.23｜强文言 0.51
+#                   人称去重 16.81｜比喻 0.00｜模糊 3.06
+#   清单 172 字：   idiom 0.00｜cluster4 127.91｜人称 0.00｜比喻 0.00
+# 区间只作「参考带」，不作出厂配额；超出时记为偏离并交人工判断。
 BASELINE = {
-    # 实测（03_长随笔_寻探我自_节选，2513 字 / 109 句）：句长 23.06、短句 0.211、
-    # 长句 0.128、逗号 1.92、文言 14.33、四字 14.33、第一人称 31.44、比喻 4.38、模糊 6.76
     "long_essay": {
         "avg_sent_len": (16.0, 34.0),
         "sent_len_sd": (10.0, 24.0),
@@ -149,16 +377,14 @@ BASELINE = {
         "long_ratio": (0.08, 0.28),
         "comma_per_sent": (1.40, 2.60),
         "question_ratio": (0.02, 0.12),
-        "wenyian_pk": (8.0, 28.0),
-        "idiom4_pk": (8.0, 24.0),
-        "first_person_pk": (18.0, 45.0),
+        "idiom_pk": (3.0, 12.0),
+        "wenyan_char_pk": (8.0, 28.0),
+        "first_uniq_pk": (18.0, 45.0),
         "colloquial_pk": (1.0, 12.0),
-        "simile_pk": (1.5, 12.0),
+        "simile_pk": (0.0, 10.0),
         "hedge_pk": (3.0, 16.0),
         "dash_pk": (0.0, 3.0),
     },
-    # 实测（01_观察清单 172 字 + 02_短札 1963 字）：句长 10.75~33.84、逗号 0.62~2.98、
-    # 第一人称 0~16.81、问句率 0.052~0.25、比喻 0~0
     "note": {
         "avg_sent_len": (8.0, 38.0),
         "sent_len_sd": (5.0, 26.0),
@@ -166,9 +392,9 @@ BASELINE = {
         "long_ratio": (0.0, 0.38),
         "comma_per_sent": (0.50, 3.20),
         "question_ratio": (0.03, 0.32),
-        "wenyian_pk": (4.0, 24.0),
-        "idiom4_pk": (0.0, 22.0),
-        "first_person_pk": (0.0, 35.0),
+        "idiom_pk": (0.0, 12.0),
+        "wenyan_char_pk": (4.0, 24.0),
+        "first_uniq_pk": (0.0, 35.0),
         "colloquial_pk": (0.0, 24.0),
         "simile_pk": (0.0, 10.0),
         "hedge_pk": (0.0, 18.0),
@@ -177,40 +403,69 @@ BASELINE = {
 }
 
 
-def judge(m: dict, mode: str):
-    """按字数缩放容差：短稿的比值指标方差大，边界外不判失败。
+def tolerance(chars: int) -> float:
+    if chars < 800:
+        return 0.25
+    if chars < 2000:
+        return 0.15
+    return 0.08
 
-    < 800 字：容差 25%；800-2000 字：15%；> 2000 字：8%。
-    硬伤（AI 味词 / emoji / Markdown 结构）不受容差影响。
-    """
+
+def judge(m: dict, mode: str):
+    """返回 (rows, warns, hard)。warns 为偏离项，hard 为硬伤项。"""
+    if mode not in BASELINE:
+        raise ValueError("unknown mode: %s" % mode)
     base = BASELINE[mode]
-    tol = 0.25 if m["chars"] < 800 else (0.15 if m["chars"] < 2000 else 0.08)
+    tol = tolerance(m["chars"])
     rows, warns = [], []
     for k, (lo, hi) in base.items():
         v = m[k]
-        lo2 = lo * (1 - tol)
-        hi2 = hi * (1 + tol) if hi > 0 else 0.0
+        lo2 = round(lo * (1 - tol), 2)
+        hi2 = round(hi * (1 + tol), 2) if hi > 0 else 0.0
         ok = lo2 <= v <= hi2
-        flag = "ok " if ok else ("LOW" if v < lo2 else "HIGH")
-        rows.append((k, v, round(lo2, 2), round(hi2, 2), flag))
+        rows.append((k, v, lo2, hi2, "ok " if ok else ("LOW" if v < lo2 else "HIGH")))
         if not ok:
-            warns.append("%s=%s 超出 [%s, %s]（容差 %d%%）" % (k, v, round(lo2, 2), round(hi2, 2), tol * 100))
+            warns.append("%s=%s 超出参考带 [%s, %s]（容差 %d%%）" % (k, v, lo2, hi2, tol * 100))
+
     hard = []
-    if m["ai_smell"]:
-        hard.append("AI 味词：" + "、".join(m["ai_smell"][:6]))
+    if m["hard_phrases"]:
+        hard.append("硬级套话：" + "、".join(m["hard_phrases"]))
     if m["emoji"]:
         hard.append("含 %d 个 emoji" % m["emoji"])
     if m["md_struct_lines"]:
-        hard.append("含 %d 行 Markdown 结构符号" % m["md_struct_lines"])
+        hard.append("含 %d 行 Markdown 结构符号（标题/列表/引用）" % m["md_struct_lines"])
     if m["ellipsis"]:
-        hard.append("含 %d 个省略号（本人全语料 0 次，改断句）" % m["ellipsis"])
+        hard.append("含 %d 个省略号（本人全语料 0 次）" % m["ellipsis"])
     if m["book_title"]:
         hard.append("含 %d 处书名号（本人写「道德经」不加书名号）" % m["book_title"])
+
+    if m["soft_phrases"]:
+        warns.append("提醒级套话：" + "、".join(m["soft_phrases"]) + "（说明文可接受，随笔里偏模板）")
     return rows, warns, hard
 
 
+def evaluate(text: str, mode: str = "auto") -> dict:
+    """供测试与外部调用的统一入口。"""
+    m = metrics(text)
+    if mode == "auto":
+        mode = "long_essay" if m["chars"] >= 600 else "note"
+    rows, warns, hard = judge(m, mode)
+    code = 1 if hard else (2 if warns else 0)
+    return {
+        "mode": mode,
+        "metrics": m,
+        "rows": rows,
+        "warns": warns,
+        "hard": hard,
+        "code": code,
+        "verdict": {0: "PASS", 1: "HARD_FAIL", 2: "DEVIATION"}[code],
+    }
+
+
+# ---------------------------------------------------------------- CLI
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="子曰文风表层特征检测器")
     ap.add_argument("--file", nargs="*", default=[])
     ap.add_argument("--text")
     ap.add_argument("--mode", choices=["long_essay", "note", "auto"], default="auto")
@@ -222,56 +477,78 @@ def main():
     root = Path(__file__).resolve().parent.parent
 
     if a.corpus:
-        for p in sorted((root / "references" / "corpus").glob("*.txt")):
+        d = root / "references" / "corpus"
+        if not d.exists():
+            print("未找到 references/corpus（该目录不随公开仓库分发）")
+            return 2
+        for p in sorted(d.glob("*.txt")):
             m = metrics(p.read_text(encoding="utf-8"))
             print(p.name, json.dumps(m, ensure_ascii=False))
         return 0
 
     if a.register:
         reg = {
-            "句子": "均句长 23 汉字（长随笔）/ 34 汉字（短札）；短句≤12 字占 15-35%；长句≥40 字占 8-28%",
-            "标点": "逗号密集（每句 1.4-2.6 个），一逗到底；破折号几乎不用；问号收段",
-            "词法": "文白夹杂，四字格每千字约 14 个；文言虚词每千字 12-14 字",
-            "人称": "第一人称每千字 31 次，「我」是叙述主轴，从不抽离为第三人称",
-            "口气": "「可能/或许/大概」概率化措辞（每千字约 7 次），绝不写绝对判断",
-            "比喻": "每千字约 4 个，取自自然与身体（蒲公英、尘埃、土地、苗、秧）",
-            "禁止": ["综上所述", "首先/其次/最后", "值得注意的是", "赋能/抓手/闭环", "emoji", "Markdown 标题与项目符号"],
+            "核心原则（必须）": [
+                "具体经验先行，判断在后",
+                "个人视角，不替群体下结论",
+                "事实用确定句，解释用推测句",
+                "长短句随内容自然变化，不设配额",
+                "允许真实的不知道",
+            ],
+            "可选特征（按需，不得为凑指标强行加）": [
+                "「可是」单用转折", "文白夹杂与四字格", "用典后自嘲",
+                "自然与身体意象", "问句收尾", "概率化措辞",
+            ],
+            "表层参考带（长随笔）": "句长 16-34｜逗号/句 1.4-2.6｜第一人称 18-45/千字｜固定四字 8-24/千字",
+            "硬伤（任何体裁）": ["赋能/抓手/闭环", "综上所述/由此可见/毋庸置疑", "emoji", "Markdown 标题与列表符号", "省略号与书名号（本人不用）"],
+            "提醒（看体裁）": ["首先/其次/最后", "因此", "总的来说", "值得注意的是", "众所周知"],
+            "能力边界": "只测表层特征。PASS 不等于像，需人工盲测，见 EVALUATION.md",
         }
         print(json.dumps(reg, ensure_ascii=False, indent=2))
         return 0
 
     if a.text:
         texts = [a.text]
-    else:
+    elif a.file:
         texts = [Path(f).read_text(encoding="utf-8") for f in a.file]
+    else:
+        ap.error("需要 --file / --text / --corpus / --register 之一")
+
     text = "\n".join(texts)
-    m = metrics(text)
+    res = evaluate(text, a.mode)
 
     if a.json:
-        print(json.dumps(m, ensure_ascii=False, indent=2))
-        return 0
+        out = {"mode": res["mode"], "verdict": res["verdict"], "code": res["code"],
+               "metrics": res["metrics"], "warns": res["warns"], "hard": res["hard"]}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return res["code"]
 
-    mode = a.mode
-    if mode == "auto":
-        mode = "long_essay" if m["chars"] >= 600 else "note"
-    rows, warns, hard = judge(m, mode)
-    print("模式：%s   汉字数：%d   句数：%d" % (mode, m["chars"], m["sentences"]))
-    for k, v, lo, hi, flag in rows:
-        print("  %-16s %8s   基线[%s, %s]  %s" % (k, v, lo, hi, flag))
+    m = res["metrics"]
+    print("模式：%s   汉字数：%d   句数：%d   判定：%s"
+          % (res["mode"], m["chars"], m["sentences"], res["verdict"]))
+    for k, v, lo, hi, flag in res["rows"]:
+        print("  %-18s %8s   参考带[%s, %s]  %s" % (k, v, lo, hi, flag))
     print("  标点：省略号 %d ｜ 书名号 %d ｜ 感叹号 %d ｜ 逗号:句号 %.2f"
-          % (m["ellipsis"], m["book_title"], m["exclaim"], m["comma_colon_ratio"]))
+          % (m["ellipsis"], m["book_title"], m["exclaim"], m["comma_period_ratio"]))
+    print("  人称：我 %.2f/千字 ｜ 自己 %.2f/千字 ｜ 去重后 %.2f/千字"
+          % (m["wo_pk"], m["self_pk"], m["first_uniq_pk"]))
+    print("  词法：固定四字 %.2f ｜ 四字块(粗) %.2f ｜ 文言候选字 %.2f ｜ 强文言标记 %.2f ｜ 比喻 %.2f"
+          % (m["idiom_pk"], m["cluster4_pk"], m["wenyan_char_pk"],
+             m["classical_mark_pk"], m["simile_pk"]))
     print()
-    if hard:
-        print("[硬伤]")
-        for h in hard:
-            print("  ✗ " + h)
-    if warns:
-        print("[偏离]")
-        for w in warns:
+
+    if res["hard"]:
+        print("[硬伤]（退出码 1）")
+        for h in res["hard"]:
+            print("  x " + h)
+    if res["warns"]:
+        print("[偏离/提醒]（退出码 2，需人工判断）")
+        for w in res["warns"]:
             print("  ! " + w)
-    if not warns and not hard:
-        print("PASS：全部指标落在本人基线内。")
-    return 1 if hard else 0
+    if res["code"] == 0:
+        print("PASS：表层指标全部落在参考带内。")
+        print("注意：这只说明表层接近，不代表读起来像本人。见 EVALUATION.md")
+    return res["code"]
 
 
 if __name__ == "__main__":
