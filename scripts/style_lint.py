@@ -126,6 +126,11 @@ def metrics(text: str) -> dict:
         "simile_pk": pk(count_any(text, SIMILE), chars),
         "hedge_pk": pk(count_any(text, HEDGE), chars),
         "dash_pk": pk(dash, chars),
+        # 标点硬伤项：作者全语料 0 次
+        "ellipsis": text.count("……") + text.count("...") + text.count("…"),
+        "book_title": text.count("《"),
+        "exclaim": text.count("！") + text.count("!"),
+        "comma_colon_ratio": round(commas / (text.count("。") or 1), 2),
         "ai_smell": smell,
         "emoji": emoji,
         "md_struct_lines": md_lines,
@@ -197,6 +202,10 @@ def judge(m: dict, mode: str):
         hard.append("含 %d 个 emoji" % m["emoji"])
     if m["md_struct_lines"]:
         hard.append("含 %d 行 Markdown 结构符号" % m["md_struct_lines"])
+    if m["ellipsis"]:
+        hard.append("含 %d 个省略号（本人全语料 0 次，改断句）" % m["ellipsis"])
+    if m["book_title"]:
+        hard.append("含 %d 处书名号（本人写「道德经」不加书名号）" % m["book_title"])
     return rows, warns, hard
 
 
@@ -249,6 +258,8 @@ def main():
     print("模式：%s   汉字数：%d   句数：%d" % (mode, m["chars"], m["sentences"]))
     for k, v, lo, hi, flag in rows:
         print("  %-16s %8s   基线[%s, %s]  %s" % (k, v, lo, hi, flag))
+    print("  标点：省略号 %d ｜ 书名号 %d ｜ 感叹号 %d ｜ 逗号:句号 %.2f"
+          % (m["ellipsis"], m["book_title"], m["exclaim"], m["comma_colon_ratio"]))
     print()
     if hard:
         print("[硬伤]")
