@@ -11,7 +11,9 @@ PASS 的含义仅限于：这些表层指标落在语料基线内。
 不得把 PASS 当成「风格验证成功」——真正的验证需要人做盲测，见 EVALUATION.md。
 
 【指标口径说明】
-- idiom_pk        固定四字表达（封闭词表命中）/ 千字。只统计词表内的，词表外一律不计。
+- idiom_pk        固定四字表达（封闭词表命中）/ 千字。
+                  **词表只收四字条目**；词表外的、以及超过四字的固定短语
+                  （如「力不能缚鸡」「野火烧不尽」）一律不计入。见 --check-lexicon。
 - cluster4_pk     长度 ≥4 的连续汉字串 / 千字。这是「四字块密度」的粗代理，
                   包含普通词组与专名，**不代表成语使用量**。
 - wo_pk           汉字「我」的出现频率。
@@ -30,14 +32,24 @@ PASS 的含义仅限于：这些表层指标落在语料基线内。
     python style_lint.py --file a.txt
     python style_lint.py --text "一段话"
     python style_lint.py --file a.txt --mode long_essay
+    python style_lint.py --file a.txt --mode generic     # 非随笔文本，只提示不判定
     python style_lint.py --file a.txt --json
     python style_lint.py --corpus        # 打印 references/corpus 的指标（校准用）
     python style_lint.py --register      # 紧凑版写作登记表
+    python style_lint.py --check-lexicon # 校验四字词表条目长度
 
-退出码（与 README、SKILL.md 保持一致）：
-    0  通过：无硬伤，也无偏离
-    1  硬伤：确定不该出现的元素（emoji / 省略号 / 书名号 / Markdown 结构 / 硬级套话）
-    2  偏离：无硬伤，但表层指标超出基线（需人工判断是否接受）
+退出码（与 README、SKILL.md、EVALUATION.md 保持一致）：
+    0  通过：无硬伤，也无提示
+    1  硬伤：**仅限该体裁下确定不该出现的元素**
+    2  提示：硬伤之外的一切（标点偏好、套话、区间偏离、结构符号）
+
+硬伤按体裁判定（v2.1 的关键改动）：
+    long_essay   Markdown 结构符号、emoji、行话（赋能/抓手/闭环…）
+    note         行话
+    generic      无硬伤，全部降为提示
+
+省略号、书名号、感叹号，以及「综上所述」「由此可见」「毋庸置疑」在任何体裁下
+都只是**提示**——那是个人标点与用词偏好，不是所有中文文本的正确性标准。
 """
 
 import argparse
@@ -59,14 +71,14 @@ HAN_CHAR = re.compile("[" + HAN + "]")
 # ---------------------------------------------------------------- 词表
 # 说明：以下均为「候选词命中」用的封闭词表，不是语法标注结果。
 
-# 硬伤级：行话与总结腔，本人语料 0 次，且在任何中文写作里都属于空转表达
-HARD_PHRASES = [
-    "赋能", "抓手", "闭环", "落地生根", "深度融合",
-    "全面提升", "综上所述", "由此可见", "毋庸置疑",
+# 行话级：空转表达。个人随笔/短札里出现即不像（generic 体裁降为提示）
+JARGON_PHRASES = [
+    "赋能", "抓手", "闭环", "落地生根", "深度融合", "全面提升",
 ]
 
-# 提醒级：在说明文/公文里完全正常，只在个人随笔里显得像模板
+# 提示级：在说明文/议论文里完全正常，只作提醒，绝不判定失败
 SOFT_PHRASES = [
+    "综上所述", "由此可见", "毋庸置疑",
     "首先，", "其次，", "最后，", "因此，", "总的来说，", "总而言之，",
     "值得注意的是，", "一方面，", "另一方面，",
     "不可否认", "众所周知", "显著提升", "至关重要", "层层递进", "深入剖析",
@@ -170,8 +182,7 @@ IDIOMS = frozenset("""
 近水楼台 返璞归真
 迫在眉睫 追根溯源
 通宵达旦 造谣惑众
-郑人买履 野火烧不尽
-量力而行 金玉良言
+郑人买履 量力而行 金玉良言
 铁证如山 锲而不舍
 闭门造车 防微杜渐
 阳奉阴违 随波逐流
@@ -355,8 +366,8 @@ def metrics(text: str) -> dict:
         "exclaim": t.count("！") + t.count("!"),
         "emoji": len(re.findall("[\U0001F300-\U0001FAFF\u2600-\u27BF]", t)),
         "md_struct_lines": md_lines,
-        # 套话分级
-        "hard_phrases": [w for w in HARD_PHRASES if w in t],
+        # 套话分级（行话可在提醒层，语体性套话一律只提醒）
+        "jargon_phrases": [w for w in JARGON_PHRASES if w in t],
         "soft_phrases": [w for w in SOFT_PHRASES if w in t],
     }
 
@@ -411,37 +422,65 @@ def tolerance(chars: int) -> float:
     return 0.08
 
 
+MODES = ("long_essay", "note", "generic")
+
+
 def judge(m: dict, mode: str):
-    """返回 (rows, warns, hard)。warns 为偏离项，hard 为硬伤项。"""
-    if mode not in BASELINE:
+    """返回 (rows, notices, hard)。
+
+    notices = 提示/偏离，**永不导致退出码 1**（个人偏好不是正确性标准）。
+    hard    = 该体裁下确定不该出现的元素，仅 long_essay / note 生效。
+    """
+    if mode not in MODES:
         raise ValueError("unknown mode: %s" % mode)
-    base = BASELINE[mode]
-    tol = tolerance(m["chars"])
-    rows, warns = [], []
-    for k, (lo, hi) in base.items():
-        v = m[k]
-        lo2 = round(lo * (1 - tol), 2)
-        hi2 = round(hi * (1 + tol), 2) if hi > 0 else 0.0
-        ok = lo2 <= v <= hi2
-        rows.append((k, v, lo2, hi2, "ok " if ok else ("LOW" if v < lo2 else "HIGH")))
-        if not ok:
-            warns.append("%s=%s 超出参考带 [%s, %s]（容差 %d%%）" % (k, v, lo2, hi2, tol * 100))
 
-    hard = []
-    if m["hard_phrases"]:
-        hard.append("硬级套话：" + "、".join(m["hard_phrases"]))
-    if m["emoji"]:
-        hard.append("含 %d 个 emoji" % m["emoji"])
+    rows, notices, hard = [], [], []
+
+    # 1) 区间比对。generic 不做：没有该体裁语料，不能拿随笔基线去量别体。
+    if mode != "generic":
+        base = BASELINE[mode]
+        tol = tolerance(m["chars"])
+        for k, (lo, hi) in base.items():
+            v = m[k]
+            lo2 = round(lo * (1 - tol), 2)
+            hi2 = round(hi * (1 + tol), 2) if hi > 0 else 0.0
+            ok = lo2 <= v <= hi2
+            rows.append((k, v, lo2, hi2, "ok " if ok else ("LOW" if v < lo2 else "HIGH")))
+            if not ok:
+                notices.append("%s=%s 超出参考带 [%s, %s]（容差 %d%%）"
+                               % (k, v, lo2, hi2, tol * 100))
+
+    # 2) 行话：随笔/短札算硬伤，generic 降为提示
+    if m["jargon_phrases"]:
+        msg = "行话：" + "、".join(m["jargon_phrases"])
+        (notices if mode == "generic" else hard).append(msg)
+
+    # 3) 结构符号：只有长随笔算硬伤（他写长文是纯散文，不用任何标记）
     if m["md_struct_lines"]:
-        hard.append("含 %d 行 Markdown 结构符号（标题/列表/引用）" % m["md_struct_lines"])
-    if m["ellipsis"]:
-        hard.append("含 %d 个省略号（本人全语料 0 次）" % m["ellipsis"])
-    if m["book_title"]:
-        hard.append("含 %d 处书名号（本人写「道德经」不加书名号）" % m["book_title"])
+        msg = "含 %d 行 Markdown 结构符号（标题/列表/引用）" % m["md_struct_lines"]
+        (hard if mode == "long_essay" else notices).append(msg)
+    if m["emoji"]:
+        msg = "含 %d 个 emoji" % m["emoji"]
+        (hard if mode == "long_essay" else notices).append(msg)
 
+    # 4) 标点偏好：一律只提示。个人标点习惯不等于文本错误。
+    if m["ellipsis"]:
+        notices.append("含 %d 个省略号（本人语料 0 次，属个人偏好，非错误）" % m["ellipsis"])
+    if m["book_title"]:
+        notices.append("含 %d 处书名号（本人写「道德经」不加书名号，属个人习惯，非错误）"
+                       % m["book_title"])
+
+    # 5) 语体性套话：一律只提示
     if m["soft_phrases"]:
-        warns.append("提醒级套话：" + "、".join(m["soft_phrases"]) + "（说明文可接受，随笔里偏模板）")
-    return rows, warns, hard
+        notices.append("语体性套话：" + "、".join(m["soft_phrases"])
+                       + "（说明文可接受，随笔里偏模板）")
+
+    return rows, notices, hard
+
+
+def lexicon_audit():
+    """返回 IDIOMS 中长度不等于 4 的条目（应为空）。"""
+    return sorted({w for w in IDIOMS if len(w) != 4})
 
 
 def evaluate(text: str, mode: str = "auto") -> dict:
@@ -449,16 +488,16 @@ def evaluate(text: str, mode: str = "auto") -> dict:
     m = metrics(text)
     if mode == "auto":
         mode = "long_essay" if m["chars"] >= 600 else "note"
-    rows, warns, hard = judge(m, mode)
-    code = 1 if hard else (2 if warns else 0)
+    rows, notices, hard = judge(m, mode)
+    code = 1 if hard else (2 if notices else 0)
     return {
         "mode": mode,
         "metrics": m,
         "rows": rows,
-        "warns": warns,
+        "notices": notices,
         "hard": hard,
         "code": code,
-        "verdict": {0: "PASS", 1: "HARD_FAIL", 2: "DEVIATION"}[code],
+        "verdict": {0: "PASS", 1: "HARD_FAIL", 2: "NOTICE"}[code],
     }
 
 
@@ -468,13 +507,24 @@ def main():
     ap = argparse.ArgumentParser(description="子曰文风表层特征检测器")
     ap.add_argument("--file", nargs="*", default=[])
     ap.add_argument("--text")
-    ap.add_argument("--mode", choices=["long_essay", "note", "auto"], default="auto")
+    ap.add_argument("--mode", choices=["long_essay", "note", "generic", "auto"], default="auto")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--corpus", action="store_true")
     ap.add_argument("--register", action="store_true")
+    ap.add_argument("--check-lexicon", action="store_true")
     a = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
+
+    if a.check_lexicon:
+        bad = lexicon_audit()
+        if bad:
+            print("词表异常：以下条目不是四字，应移出 IDIOMS：")
+            for w in bad:
+                print("  - %s（%d 字）" % (w, len(w)))
+            return 1
+        print("词表 OK：%d 条，全部为四字。" % len(IDIOMS))
+        return 0
 
     if a.corpus:
         d = root / "references" / "corpus"
@@ -499,9 +549,13 @@ def main():
                 "「可是」单用转折", "文白夹杂与四字格", "用典后自嘲",
                 "自然与身体意象", "问句收尾", "概率化措辞",
             ],
-            "表层参考带（长随笔）": "句长 16-34｜逗号/句 1.4-2.6｜第一人称 18-45/千字｜固定四字 8-24/千字",
-            "硬伤（任何体裁）": ["赋能/抓手/闭环", "综上所述/由此可见/毋庸置疑", "emoji", "Markdown 标题与列表符号", "省略号与书名号（本人不用）"],
-            "提醒（看体裁）": ["首先/其次/最后", "因此", "总的来说", "值得注意的是", "众所周知"],
+            "表层参考带（长随笔）": "句长 16-34｜逗号/句 1.4-2.6｜第一人称 18-45/千字｜固定四字 3-12/千字",
+            "硬伤（仅 long_essay）": ["Markdown 标题与列表符号", "emoji", "行话：赋能/抓手/闭环/落地生根"],
+            "硬伤（仅 note）": ["行话：赋能/抓手/闭环/落地生根"],
+            "提示（所有体裁，不判失败）": [
+                "省略号", "书名号", "综上所述/由此可见/毋庸置疑",
+                "首先/其次/最后", "因此", "总的来说", "众所周知",
+            ],
             "能力边界": "只测表层特征。PASS 不等于像，需人工盲测，见 EVALUATION.md",
         }
         print(json.dumps(reg, ensure_ascii=False, indent=2))
@@ -519,7 +573,7 @@ def main():
 
     if a.json:
         out = {"mode": res["mode"], "verdict": res["verdict"], "code": res["code"],
-               "metrics": res["metrics"], "warns": res["warns"], "hard": res["hard"]}
+               "metrics": res["metrics"], "notices": res["notices"], "hard": res["hard"]}
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return res["code"]
 
@@ -538,15 +592,15 @@ def main():
     print()
 
     if res["hard"]:
-        print("[硬伤]（退出码 1）")
+        print("[硬伤]（退出码 1，仅该体裁适用）")
         for h in res["hard"]:
             print("  x " + h)
-    if res["warns"]:
-        print("[偏离/提醒]（退出码 2，需人工判断）")
-        for w in res["warns"]:
+    if res["notices"]:
+        print("[提示]（退出码 2，需人工判断，不是错误）")
+        for w in res["notices"]:
             print("  ! " + w)
     if res["code"] == 0:
-        print("PASS：表层指标全部落在参考带内。")
+        print("PASS：表层指标全部落在参考带内，也无提示项。")
         print("注意：这只说明表层接近，不代表读起来像本人。见 EVALUATION.md")
     return res["code"]
 
